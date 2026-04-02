@@ -164,8 +164,11 @@ export function ManagerShell({ children, email, fullName, branch }: ManagerShell
       return;
     }
 
+    await supabase.auth.signOut();
     setIsUpdatingPassword(false);
     setIsResetPasswordOpen(false);
+    router.replace('/');
+    router.refresh();
   };
 
   return (

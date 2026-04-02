@@ -76,8 +76,11 @@ export default function CashierNavbar({ email, userName, branch }: CashierNavbar
       return;
     }
 
+    await supabase.auth.signOut();
     setIsUpdatingPassword(false);
     setIsResetPasswordOpen(false);
+    router.replace('/');
+    router.refresh();
   };
 
   const handleNavigate = (path: string) => {

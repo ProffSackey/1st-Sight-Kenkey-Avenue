@@ -173,8 +173,11 @@ export function AdminShell({ children, email, fullName }: AdminShellProps) {
       return;
     }
 
+    await supabase.auth.signOut();
     setIsUpdatingPassword(false);
     setIsResetPasswordOpen(false);
+    router.replace('/');
+    router.refresh();
   };
 
   return (
