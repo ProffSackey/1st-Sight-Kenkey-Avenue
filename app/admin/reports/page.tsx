@@ -7,6 +7,7 @@ interface RawOrderItem {
   item_id: string;
   quantity_sold: number;
   line_total: number;
+  item?: { name?: string };
 }
 
 interface RawOrder {
@@ -17,23 +18,13 @@ interface RawOrder {
   payment_method: string | null;
   order_date: string;
   cashier_id: string;
+  branch?: { id?: string; name?: string };
+  cashier?: { id?: string | null; full_name?: string | null; email?: string | null };
   order_items: RawOrderItem[];
 }
 
-interface EmployeeRecord {
-  id: string;
-  full_name: string;
-  email: string;
-}
-
-interface ItemRecord {
-  id: string;
-  name: string;
-}
-
-interface BranchRecord {
-  id: string;
-  name: string | null;
+interface OrdersApiResponse {
+  orders: RawOrder[];
 }
 
 interface TrendPoint {
@@ -47,6 +38,7 @@ interface ChartPoint {
   x: number;
   y: number;
   data: TrendPoint;
+  index: number;
 }
 
 interface TopEmployee {
@@ -164,155 +156,158 @@ export default function AdminReportsPage() {
     const run = async () => {
       setLoading(true);
       setError(null);
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        const token = session?.access_token;
 
-      const { data: orderData, error: orderError } = await supabase
-        .from('orders')
-        .select('id, branch_id, final_amount, total_amount, payment_method, order_date, cashier_id, order_items(item_id, quantity_sold, line_total)')
-        .gte('order_date', startDate)
-        .lte('order_date', endDate)
-        .order('order_date', { ascending: false })
-        .limit(4000);
+        if (!token) {
+          throw new Error('Missing access token');
+        }
 
-      if (orderError) {
+        const response = await fetch('/api/admin/orders', {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        let payload: OrdersApiResponse | { error?: string; details?: string } | null = null;
+        try {
+          payload = await response.json();
+        } catch {
+          payload = null;
+        }
+
+        if (!response.ok) {
+          throw new Error(
+            `HTTP ${response.status}: ${response.statusText}${payload && 'error' in payload && payload.error ? ` - ${payload.error}` : ''}`,
+          );
+        }
+
+        const orders = (((payload as OrdersApiResponse | null)?.orders || []) as RawOrder[]).filter(
+          (order) => order.order_date >= startDate && order.order_date <= endDate,
+        );
+
+        if (!orders.length) {
+          if (active) {
+            setAnalytics(createEmptyAnalytics(startDate, endDate));
+            setLoading(false);
+          }
+          return;
+        }
+
+        const trendMap = new Map(buildTrendRange(startDate, endDate).map((t) => [t.date, t]));
+        const employeeAgg = new Map<string, TopEmployee>();
+        const itemAgg = new Map<string, TopItem>();
+        const branchAgg = new Map<string, TopBranch>();
+        const paymentAgg = new Map<string, { count: number; revenue: number }>();
+
+        let totalRevenue = 0;
+        let totalOrders = 0;
+        let totalUnitsSold = 0;
+
+        orders.forEach((order) => {
+          const amount = Number(order.final_amount ?? order.total_amount ?? 0);
+          const payment = order.payment_method || 'Unknown';
+
+          totalRevenue += amount;
+          totalOrders += 1;
+
+          if (trendMap.has(order.order_date)) {
+            const slot = trendMap.get(order.order_date)!;
+            slot.revenue += amount;
+            slot.orders += 1;
+          }
+
+          const currentEmployee = employeeAgg.get(order.cashier_id) || {
+            name: order.cashier?.full_name || 'Unknown Employee',
+            email: order.cashier?.email || 'unknown@example.com',
+            orders: 0,
+            revenue: 0,
+          };
+          employeeAgg.set(order.cashier_id, {
+            ...currentEmployee,
+            orders: currentEmployee.orders + 1,
+            revenue: currentEmployee.revenue + amount,
+          });
+
+          const branchName = order.branch?.name || order.branch_id || 'Unknown Branch';
+          const currentBranch = branchAgg.get(order.branch_id) || {
+            id: order.branch_id,
+            name: branchName,
+            orders: 0,
+            revenue: 0,
+          };
+          branchAgg.set(order.branch_id, {
+            ...currentBranch,
+            orders: currentBranch.orders + 1,
+            revenue: currentBranch.revenue + amount,
+          });
+
+          const currentPayment = paymentAgg.get(payment) || { count: 0, revenue: 0 };
+          paymentAgg.set(payment, {
+            count: currentPayment.count + 1,
+            revenue: currentPayment.revenue + amount,
+          });
+
+          (order.order_items || []).forEach((oi) => {
+            const quantitySold = Number(oi.quantity_sold || 0);
+            const currentItem = itemAgg.get(oi.item_id) || {
+              name: oi.item?.name || 'Unknown Item',
+              quantity: 0,
+              revenue: 0,
+            };
+            itemAgg.set(oi.item_id, {
+              ...currentItem,
+              quantity: currentItem.quantity + quantitySold,
+              revenue: currentItem.revenue + Number(oi.line_total || 0),
+            });
+            totalUnitsSold += quantitySold;
+          });
+        });
+
+        const paymentMix = Array.from(paymentAgg.entries())
+          .map(([method, value]) => ({
+            method,
+            count: value.count,
+            revenue: value.revenue,
+            share: totalOrders > 0 ? (value.count / totalOrders) * 100 : 0,
+          }))
+          .sort((a, b) => b.count - a.count || b.revenue - a.revenue);
+
+        const topPaymentMethod = paymentMix[0] || null;
+        const topEmployee = Array.from(employeeAgg.values()).sort((a, b) => b.revenue - a.revenue || b.orders - a.orders)[0] || null;
+        const topItem = Array.from(itemAgg.values()).sort((a, b) => b.quantity - a.quantity || b.revenue - a.revenue)[0] || null;
+        const topBranch = Array.from(branchAgg.values()).sort((a, b) => b.revenue - a.revenue || b.orders - a.orders)[0] || null;
+
+        if (active) {
+          setAnalytics({
+            totalRevenue,
+            totalOrders,
+            totalUnitsSold,
+            activeCashiers: employeeAgg.size,
+            activeItems: itemAgg.size,
+            activeBranches: branchAgg.size,
+            averageOrderValue: totalOrders > 0 ? totalRevenue / totalOrders : 0,
+            topEmployee,
+            topItem,
+            topBranch,
+            topPaymentMethod,
+            paymentMix,
+            trend: Array.from(trendMap.values()),
+          });
+          setLoading(false);
+        }
+      } catch (fetchError) {
+        console.error(
+          'Admin reports analytics error:',
+          fetchError instanceof Error ? fetchError.message : String(fetchError),
+          fetchError,
+        );
         if (active) {
           setError('Could not load organization analytics.');
           setAnalytics(createEmptyAnalytics(startDate, endDate));
           setLoading(false);
         }
-        return;
-      }
-
-      const orders = (orderData || []) as RawOrder[];
-      if (!orders.length) {
-        if (active) {
-          setAnalytics(createEmptyAnalytics(startDate, endDate));
-          setLoading(false);
-        }
-        return;
-      }
-
-      const cashierIds = Array.from(new Set(orders.map((o) => o.cashier_id).filter(Boolean)));
-      const itemIds = Array.from(new Set(orders.flatMap((o) => (o.order_items || []).map((oi) => oi.item_id).filter(Boolean))));
-      const branchIds = Array.from(new Set(orders.map((o) => o.branch_id).filter(Boolean)));
-
-      const [{ data: cashiers }, { data: items }, { data: branches }] = await Promise.all([
-        cashierIds.length
-          ? supabase.from('employees').select('id, full_name, email').in('id', cashierIds)
-          : Promise.resolve({ data: [] as EmployeeRecord[] }),
-        itemIds.length
-          ? supabase.from('items').select('id, name').in('id', itemIds)
-          : Promise.resolve({ data: [] as ItemRecord[] }),
-        branchIds.length
-          ? supabase.from('branches').select('id, name').in('id', branchIds)
-          : Promise.resolve({ data: [] as BranchRecord[] }),
-      ]);
-
-      const cashierMap = new Map<string, EmployeeRecord>((cashiers || []).map((c) => [c.id, c]));
-      const itemMap = new Map<string, string>((items || []).map((i) => [i.id, i.name]));
-      const branchMap = new Map<string, string>((branches || []).map((b) => [b.id, b.name || b.id]));
-      const trendMap = new Map(buildTrendRange(startDate, endDate).map((t) => [t.date, t]));
-
-      const employeeAgg = new Map<string, TopEmployee>();
-      const itemAgg = new Map<string, TopItem>();
-      const branchAgg = new Map<string, TopBranch>();
-      const paymentAgg = new Map<string, { count: number; revenue: number }>();
-
-      let totalRevenue = 0;
-      let totalOrders = 0;
-      let totalUnitsSold = 0;
-
-      orders.forEach((order) => {
-        const amount = Number(order.final_amount ?? order.total_amount ?? 0);
-        const payment = order.payment_method || 'Unknown';
-
-        totalRevenue += amount;
-        totalOrders += 1;
-
-        if (trendMap.has(order.order_date)) {
-          const slot = trendMap.get(order.order_date)!;
-          slot.revenue += amount;
-          slot.orders += 1;
-        }
-
-        const employeeMeta = cashierMap.get(order.cashier_id);
-        const currentEmployee = employeeAgg.get(order.cashier_id) || {
-          name: employeeMeta?.full_name || 'Unknown Employee',
-          email: employeeMeta?.email || 'unknown@example.com',
-          orders: 0,
-          revenue: 0,
-        };
-        employeeAgg.set(order.cashier_id, {
-          ...currentEmployee,
-          orders: currentEmployee.orders + 1,
-          revenue: currentEmployee.revenue + amount,
-        });
-
-        const branchName = branchMap.get(order.branch_id) || order.branch_id || 'Unknown Branch';
-        const currentBranch = branchAgg.get(order.branch_id) || {
-          id: order.branch_id,
-          name: branchName,
-          orders: 0,
-          revenue: 0,
-        };
-        branchAgg.set(order.branch_id, {
-          ...currentBranch,
-          orders: currentBranch.orders + 1,
-          revenue: currentBranch.revenue + amount,
-        });
-
-        const currentPayment = paymentAgg.get(payment) || { count: 0, revenue: 0 };
-        paymentAgg.set(payment, {
-          count: currentPayment.count + 1,
-          revenue: currentPayment.revenue + amount,
-        });
-
-        (order.order_items || []).forEach((oi) => {
-          const quantitySold = Number(oi.quantity_sold || 0);
-          const currentItem = itemAgg.get(oi.item_id) || {
-            name: itemMap.get(oi.item_id) || 'Unknown Item',
-            quantity: 0,
-            revenue: 0,
-          };
-          itemAgg.set(oi.item_id, {
-            ...currentItem,
-            quantity: currentItem.quantity + quantitySold,
-            revenue: currentItem.revenue + Number(oi.line_total || 0),
-          });
-          totalUnitsSold += quantitySold;
-        });
-      });
-
-      const paymentMix = Array.from(paymentAgg.entries())
-        .map(([method, value]) => ({
-          method,
-          count: value.count,
-          revenue: value.revenue,
-          share: totalOrders > 0 ? (value.count / totalOrders) * 100 : 0,
-        }))
-        .sort((a, b) => b.count - a.count || b.revenue - a.revenue);
-
-      const topPaymentMethod = paymentMix[0] || null;
-      const topEmployee = Array.from(employeeAgg.values()).sort((a, b) => b.revenue - a.revenue || b.orders - a.orders)[0] || null;
-      const topItem = Array.from(itemAgg.values()).sort((a, b) => b.quantity - a.quantity || b.revenue - a.revenue)[0] || null;
-      const topBranch = Array.from(branchAgg.values()).sort((a, b) => b.revenue - a.revenue || b.orders - a.orders)[0] || null;
-
-      if (active) {
-        setAnalytics({
-          totalRevenue,
-          totalOrders,
-          totalUnitsSold,
-          activeCashiers: employeeAgg.size,
-          activeItems: itemAgg.size,
-          activeBranches: branchAgg.size,
-          averageOrderValue: totalOrders > 0 ? totalRevenue / totalOrders : 0,
-          topEmployee,
-          topItem,
-          topBranch,
-          topPaymentMethod,
-          paymentMix,
-          trend: Array.from(trendMap.values()),
-        });
-        setLoading(false);
       }
     };
 
@@ -344,8 +339,17 @@ export default function AdminReportsPage() {
     const points: ChartPoint[] = analytics.trend.map((point, idx) => {
       const x = pad.left + (idx / Math.max(analytics.trend.length - 1, 1)) * innerWidth;
       const y = pad.top + innerHeight - (point.revenue / maxValue) * innerHeight;
-      return { x, y, data: point };
+      return { x, y, data: point, index: idx };
     });
+
+    const xLabelStep =
+      analytics.trend.length <= 7
+        ? 1
+        : analytics.trend.length <= 14
+          ? 2
+          : analytics.trend.length <= 31
+            ? 4
+            : 7;
 
     const linePath = points.map((point, idx) => `${idx === 0 ? 'M' : 'L'} ${point.x} ${point.y}`).join(' ');
     const areaPath = `${linePath} L ${points[points.length - 1].x} ${pad.top + innerHeight} L ${points[0].x} ${pad.top + innerHeight} Z`;
@@ -355,7 +359,7 @@ export default function AdminReportsPage() {
       return { y, value: maxValue * fraction };
     });
 
-    return { width, height, pad, innerWidth, innerHeight, points, linePath, areaPath, yTicks };
+    return { width, height, pad, innerWidth, innerHeight, points, linePath, areaPath, yTicks, xLabelStep };
   }, [analytics.trend]);
   const paymentChart = useMemo(() => {
     if (!analytics.paymentMix.length) return null;
@@ -482,7 +486,7 @@ export default function AdminReportsPage() {
           </div>
         </div>
 
-        <div className="relative mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
+        <div className="relative mt-5 grid grid-cols-2 gap-3 xl:grid-cols-5">
           <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
             <p className="text-xs uppercase tracking-wide text-emerald-700">Total Revenue</p>
             <p className="mt-1 text-xl font-semibold text-emerald-900">{formatCurrency(analytics.totalRevenue)}</p>
@@ -563,7 +567,13 @@ export default function AdminReportsPage() {
                     </g>
                   ))}
 
-                  {revenueChart?.points.map((point) => (
+                  {revenueChart?.points
+                    .filter(
+                      (point) =>
+                        point.index % revenueChart.xLabelStep === 0 ||
+                        point.index === revenueChart.points.length - 1,
+                    )
+                    .map((point) => (
                     <g key={`${point.data.date}-label`}>
                       <text
                         x={point.x}
@@ -574,15 +584,6 @@ export default function AdminReportsPage() {
                         textAnchor="middle"
                       >
                         {point.data.label}
-                      </text>
-                      <text
-                        x={point.x}
-                        y={revenueChart.pad.top + revenueChart.innerHeight + 34}
-                        fill="#64748b"
-                        fontSize="10"
-                        textAnchor="middle"
-                      >
-                        {point.data.orders} ord
                       </text>
                     </g>
                   ))}
