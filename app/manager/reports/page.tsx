@@ -9,6 +9,7 @@ interface RawOrderItem {
   item_id: string;
   quantity_sold: number;
   line_total: number;
+  item?: { name?: string };
 }
 
 interface RawOrder {
